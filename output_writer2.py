@@ -1,7 +1,10 @@
 """
 output_writer.py
 -----------------
-Takes raw OCR results and saves to both .txt and .docx files.
+Takes raw OCR results (list of {text, confidence, box} dicts) and:
+    1. Formats them for clean terminal display (with confidence scores)
+    2. Saves output to both .txt and .docx files
+    3. Handles multi-page results (PDFs) by clearly labeling page breaks
 """
 
 import os
@@ -9,6 +12,8 @@ from datetime import datetime
 
 try:
     from docx import Document
+    from docx.shared import Pt, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
     DOCX_AVAILABLE = True
 except ImportError:
     DOCX_AVAILABLE = False
@@ -40,51 +45,67 @@ def calculate_average_confidence(results: list) -> float:
     return round((total / len(results)) * 100, 2)
 
 
-def _build_image_docx(results: list, source_filename: str):
+# ─── DOCX helpers ────────────────────────────────────────────────────────────
+
+def _build_image_docx(results: list, source_filename: str) -> "Document":
     doc = Document()
     doc.add_heading("OCR Output Report", level=1)
+
     info = doc.add_paragraph()
-    info.add_run(f"Source File       : {os.path.basename(source_filename)}\n")
+    info.add_run(f"Source File       : {os.path.basename(source_filename)}\n").bold = False
     info.add_run(f"Processed On      : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
     info.add_run(f"Lines Detected    : {len(results)}\n")
     info.add_run(f"Average Confidence: {calculate_average_confidence(results)}%\n")
+
     doc.add_paragraph("─" * 40)
     doc.add_heading("Extracted Text", level=2)
+
     for item in results:
         doc.add_paragraph(item["text"])
+
     return doc
 
 
-def _build_pdf_docx(page_results: list, source_filename: str):
+def _build_pdf_docx(page_results: list, source_filename: str) -> "Document":
     doc = Document()
     doc.add_heading("OCR Output Report (Multi-Page PDF)", level=1)
+
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     total_lines = sum(len(p) for p in page_results)
     all_conf = [item["confidence"] for page in page_results for item in page]
     avg_conf = round((sum(all_conf) / len(all_conf)) * 100, 2) if all_conf else 0.0
+
     info = doc.add_paragraph()
     info.add_run(f"Source File       : {os.path.basename(source_filename)}\n")
     info.add_run(f"Processed On      : {timestamp}\n")
     info.add_run(f"Total Pages       : {len(page_results)}\n")
     info.add_run(f"Total Lines       : {total_lines}\n")
     info.add_run(f"Average Confidence: {avg_conf}%\n")
+
     for page_num, results in enumerate(page_results, start=1):
         doc.add_paragraph("─" * 40)
         page_avg = calculate_average_confidence(results)
-        doc.add_heading(f"Page {page_num}  (Lines: {len(results)}, Avg Confidence: {page_avg}%)", level=2)
+        doc.add_heading(
+            f"Page {page_num}  (Lines: {len(results)}, Avg Confidence: {page_avg}%)",
+            level=2
+        )
         if results:
             for item in results:
                 doc.add_paragraph(item["text"])
         else:
             doc.add_paragraph("[No text detected on this page]")
+
     return doc
 
 
+# ─── Public save functions ────────────────────────────────────────────────────
+
 def save_image_ocr_output(results: list, source_filename: str, output_dir: str):
+    """Save image OCR results to .txt and .docx. Returns (txt_path, docx_path)."""
     os.makedirs(output_dir, exist_ok=True)
     base_name = os.path.splitext(os.path.basename(source_filename))[0]
 
-    # TXT
+    # --- TXT ---
     txt_path = os.path.join(output_dir, f"{base_name}_ocr_output.txt")
     avg_conf = calculate_average_confidence(results)
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -102,7 +123,7 @@ def save_image_ocr_output(results: list, source_filename: str, output_dir: str):
         f.write(format_plain_text(results))
         f.write("\n")
 
-    # DOCX
+    # --- DOCX ---
     docx_path = None
     if DOCX_AVAILABLE:
         docx_path = os.path.join(output_dir, f"{base_name}_ocr_output.docx")
@@ -112,15 +133,17 @@ def save_image_ocr_output(results: list, source_filename: str, output_dir: str):
 
 
 def save_pdf_ocr_output(page_results: list, source_filename: str, output_dir: str):
+    """Save PDF OCR results to .txt and .docx. Returns (txt_path, docx_path)."""
     os.makedirs(output_dir, exist_ok=True)
     base_name = os.path.splitext(os.path.basename(source_filename))[0]
 
-    # TXT
+    # --- TXT ---
     txt_path = os.path.join(output_dir, f"{base_name}_ocr_output.txt")
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     total_lines = sum(len(p) for p in page_results)
     all_conf = [item["confidence"] for page in page_results for item in page]
     avg_conf = round((sum(all_conf) / len(all_conf)) * 100, 2) if all_conf else 0.0
+
     header = (
         f"OCR Output Report (Multi-Page PDF)\n"
         f"{'=' * 50}\n"
@@ -137,12 +160,13 @@ def save_pdf_ocr_output(page_results: list, source_filename: str, output_dir: st
         page_header = f"\n--- Page {page_num} (Lines: {len(results)}, Avg Confidence: {page_avg}%) ---\n"
         page_text = format_plain_text(results) if results else "[No text detected on this page]"
         body_parts.append(page_header + page_text)
+
     with open(txt_path, "w", encoding="utf-8") as f:
         f.write(header)
         f.write("\n".join(body_parts))
         f.write("\n")
 
-    # DOCX
+    # --- DOCX ---
     docx_path = None
     if DOCX_AVAILABLE:
         docx_path = os.path.join(output_dir, f"{base_name}_ocr_output.docx")

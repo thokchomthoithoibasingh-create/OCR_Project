@@ -2,7 +2,19 @@
 main.py
 -------
 Command-line entry point for the OCR project.
-Run: python main.py
+
+This is the file you actually RUN. It presents a menu, takes user
+input, validates it, and calls into the other modules (preprocess,
+ocr_engine, pdf_handler, output_writer) to do the real work.
+
+Run it from the project root with:
+    python src/main.py
+
+WHY a single CLI entry point:
+Keeping all user interaction (menus, input(), print()) in this one
+file — and keeping all the "real logic" in the other modules — means
+the OCR/preprocessing code stays reusable and testable independently
+of the command-line interface around it.
 """
 
 import os
@@ -10,6 +22,9 @@ import sys
 import glob
 import traceback
 
+# Allow running this file directly (python src/main.py) by adding the
+# project root to sys.path, so "from src.xxx import yyy" style imports
+# aren't required — we just import sibling modules directly.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from preprocess import preprocess_image
@@ -23,10 +38,10 @@ from output_writer import (
 )
 
 SUPPORTED_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif")
+OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output", "text_outputs")
 
-# Fixed output path — saves inside your project folder
-OUTPUT_DIR = "/workspaces/OCR_Project/output/text_outputs"
-
+# Set this if Poppler is NOT on your system PATH. Example:
+# POPPLER_PATH = r"C:\poppler\Library\bin"
 POPPLER_PATH = None
 
 
@@ -47,49 +62,19 @@ def print_menu():
 
 
 def get_validated_path(prompt: str, must_exist: bool = True) -> str:
+    """
+    Prompt the user for a file path and validate it. Loops until a
+    valid path is given, or the user types 'cancel' to abort.
+    """
     while True:
-        path = input(prompt).strip().strip('"')
+        path = input(prompt).strip().strip('"')  # strip quotes pasted from Windows Explorer
         if path.lower() == "cancel":
             return None
         if must_exist and not os.path.exists(path):
             print(f"[ERROR] File not found: {path}")
-            print("        Tip: drag-and-drop the file into the terminal to paste its path.")
+            print("        Tip: you can drag-and-drop the file into the terminal to paste its path.")
             continue
         return path
-
-
-def show_txt_output(txt_path: str):
-    print("\n" + "=" * 60)
-    print("               TXT OUTPUT")
-    print("=" * 60)
-    try:
-        with open(txt_path, "r", encoding="utf-8") as f:
-            print(f.read())
-    except Exception as e:
-        print(f"[ERROR] Could not read txt file: {e}")
-    print("=" * 60)
-    print(f"[TXT FILE] Saved at: {txt_path}")
-    print("=" * 60)
-
-
-def show_docx_output(docx_path: str):
-    if docx_path is None:
-        print("\n[INFO] DOCX skipped — run: pip install python-docx")
-        return
-    print("\n" + "=" * 60)
-    print("               DOCX OUTPUT")
-    print("=" * 60)
-    try:
-        from docx import Document
-        doc = Document(docx_path)
-        for para in doc.paragraphs:
-            if para.text.strip():
-                print(para.text)
-    except Exception as e:
-        print(f"[ERROR] Could not read docx file: {e}")
-    print("=" * 60)
-    print(f"[DOCX FILE] Saved at: {docx_path}")
-    print("=" * 60)
 
 
 def handle_image_ocr(engine: OCREngine):
@@ -111,22 +96,18 @@ def handle_image_ocr(engine: OCREngine):
         print("[INFO] Running OCR (this may take a few seconds)...")
         results = engine.run(processed)
 
-        if not results:
-            print("[WARNING] No text was detected.")
-            return
-
-        print(f"\nAverage Confidence: {calculate_average_confidence(results)}%")
+        print("\n--- EXTRACTED TEXT ---")
+        print(format_results_for_display(results, show_confidence=True))
+        print("-" * 40)
+        print(f"Average Confidence: {calculate_average_confidence(results)}%")
         print(f"Lines Detected    : {len(results)}")
 
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-        txt_path, docx_path = save_image_ocr_output(results, image_path, OUTPUT_DIR)
+        if not results:
+            print("[WARNING] No text was detected. Try a clearer image or check preprocessing settings.")
+            return
 
-        print(f"\n[SUCCESS] TXT  saved to: {txt_path}")
-        if docx_path:
-            print(f"[SUCCESS] DOCX saved to: {docx_path}")
-
-        show_txt_output(txt_path)
-        show_docx_output(docx_path)
+        output_path = save_image_ocr_output(results, image_path, OUTPUT_DIR)
+        print(f"\n[SUCCESS] Output saved to: {output_path}")
 
     except FileNotFoundError as e:
         print(f"[ERROR] {e}")
@@ -156,39 +137,46 @@ def handle_pdf_ocr(engine: OCREngine):
         total_pages = get_pdf_page_count(pdf_path, poppler_path=POPPLER_PATH)
         print(f"[INFO] {total_pages} page(s) found.")
 
+        # Pages are rendered and processed ONE AT A TIME via iter_pdf_pages
+        # rather than all at once, so memory use stays roughly constant
+        # regardless of how many pages the PDF has. This avoids the
+        # MemoryError that can occur converting many/large pages together.
         all_page_results = []
         for page_number, page_image in iter_pdf_pages(pdf_path, dpi=150, poppler_path=POPPLER_PATH):
-            print(f"[INFO] Running OCR on page {page_number}/{total_pages}...", flush=True)
+            print(f"[INFO] Running OCR on page {page_number}/{total_pages}... (this can take 10-30s per page on CPU)", flush=True)
 
             resized = resize_image(page_image, max_dimension=2000)
             gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+
             try:
                 denoised = cv2.fastNlMeansDenoising(gray, h=10)
             except cv2.error as denoise_err:
-                print(f"         -> [WARNING] Denoising failed ({denoise_err}); using grayscale.")
+                # Denoising can fail on very large/complex pages even after
+                # resizing (memory pressure varies by machine). Fall back to
+                # the un-denoised grayscale page rather than losing the whole
+                # PDF run over one page.
+                print(f"         -> [WARNING] Denoising failed on this page ({denoise_err}); using grayscale without denoising.")
                 denoised = gray
 
             processed = cv2.cvtColor(denoised, cv2.COLOR_GRAY2BGR)
+
             results = engine.run(processed)
             all_page_results.append(results)
 
             page_conf = calculate_average_confidence(results)
             print(f"         -> {len(results)} line(s) detected, avg confidence {page_conf}%")
+
+            # Explicitly drop references to this page's image data before
+            # the next loop iteration renders the next page.
             del page_image, resized, gray, denoised, processed
 
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-        txt_path, docx_path = save_pdf_ocr_output(all_page_results, pdf_path, OUTPUT_DIR)
+        output_path = save_pdf_ocr_output(all_page_results, pdf_path, OUTPUT_DIR)
 
-        total_lines = sum(len(p) for p in all_page_results)
         print("\n--- SUMMARY ---")
+        total_lines = sum(len(p) for p in all_page_results)
         print(f"Total Pages   : {total_pages}")
         print(f"Total Lines   : {total_lines}")
-        print(f"\n[SUCCESS] TXT  saved to: {txt_path}")
-        if docx_path:
-            print(f"[SUCCESS] DOCX saved to: {docx_path}")
-
-        show_txt_output(txt_path)
-        show_docx_output(docx_path)
+        print(f"[SUCCESS] Output saved to: {output_path}")
 
     except FileNotFoundError as e:
         print(f"[ERROR] {e}")
@@ -221,22 +209,15 @@ def handle_batch_ocr(engine: OCREngine):
 
     success_count = 0
     fail_count = 0
-    saved_pairs = []
-
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     for idx, image_path in enumerate(image_files, start=1):
         print(f"[{idx}/{len(image_files)}] Processing: {os.path.basename(image_path)}")
         try:
             processed = preprocess_image(image_path, do_grayscale=True, do_denoise=True, do_resize=True)
             results = engine.run(processed)
-            txt_path, docx_path = save_image_ocr_output(results, image_path, OUTPUT_DIR)
+            output_path = save_image_ocr_output(results, image_path, OUTPUT_DIR)
             conf = calculate_average_confidence(results)
-            print(f"         -> {len(results)} line(s), avg confidence {conf}%")
-            print(f"            TXT : {txt_path}")
-            if docx_path:
-                print(f"            DOCX: {docx_path}")
-            saved_pairs.append((txt_path, docx_path))
+            print(f"         -> {len(results)} line(s), avg confidence {conf}% -> saved: {os.path.basename(output_path)}")
             success_count += 1
         except Exception as e:
             print(f"         -> [ERROR] Failed: {e}")
@@ -244,19 +225,15 @@ def handle_batch_ocr(engine: OCREngine):
 
     print(f"\n[BATCH COMPLETE] Success: {success_count} | Failed: {fail_count}")
 
-    for txt_path, docx_path in saved_pairs:
-        show_txt_output(txt_path)
-        show_docx_output(docx_path)
-
 
 def main():
     print_banner()
-    print(f"[INFO] Output folder: {OUTPUT_DIR}")
     print("[INFO] Initializing OCR engine (loading PaddleOCR models)...")
     try:
         engine = OCREngine(lang="en", use_angle_cls=True)
     except Exception as e:
         print(f"[FATAL] Could not initialize PaddleOCR: {e}")
+        print("        Check your installation — see PHASE 2 of the project guide.")
         sys.exit(1)
 
     while True:

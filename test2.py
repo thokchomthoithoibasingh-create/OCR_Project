@@ -2,7 +2,7 @@
 main.py
 -------
 Command-line entry point for the OCR project.
-Run: python main.py
+Run: python src/main.py
 """
 
 import os
@@ -23,10 +23,7 @@ from output_writer import (
 )
 
 SUPPORTED_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif")
-
-# Fixed output path — saves inside your project folder
-OUTPUT_DIR = "/workspaces/OCR_Project/output/text_outputs"
-
+OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output", "text_outputs")
 POPPLER_PATH = None
 
 
@@ -59,8 +56,9 @@ def get_validated_path(prompt: str, must_exist: bool = True) -> str:
 
 
 def show_txt_output(txt_path: str):
+    """Print the .txt output file contents in the terminal."""
     print("\n" + "=" * 60)
-    print("               TXT OUTPUT")
+    print("               📄 TXT OUTPUT")
     print("=" * 60)
     try:
         with open(txt_path, "r", encoding="utf-8") as f:
@@ -73,11 +71,14 @@ def show_txt_output(txt_path: str):
 
 
 def show_docx_output(docx_path: str):
+    """Print the .docx output file contents in the terminal."""
     if docx_path is None:
-        print("\n[INFO] DOCX skipped — run: pip install python-docx")
+        print("\n[INFO] DOCX output skipped (python-docx not installed).")
+        print("       Run: pip install python-docx")
         return
+
     print("\n" + "=" * 60)
-    print("               DOCX OUTPUT")
+    print("               📝 DOCX OUTPUT")
     print("=" * 60)
     try:
         from docx import Document
@@ -125,6 +126,7 @@ def handle_image_ocr(engine: OCREngine):
         if docx_path:
             print(f"[SUCCESS] DOCX saved to: {docx_path}")
 
+        # Show both outputs in terminal
         show_txt_output(txt_path)
         show_docx_output(docx_path)
 
@@ -158,10 +160,11 @@ def handle_pdf_ocr(engine: OCREngine):
 
         all_page_results = []
         for page_number, page_image in iter_pdf_pages(pdf_path, dpi=150, poppler_path=POPPLER_PATH):
-            print(f"[INFO] Running OCR on page {page_number}/{total_pages}...", flush=True)
+            print(f"[INFO] Running OCR on page {page_number}/{total_pages}... (this can take 10-30s per page on CPU)", flush=True)
 
             resized = resize_image(page_image, max_dimension=2000)
             gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+
             try:
                 denoised = cv2.fastNlMeansDenoising(gray, h=10)
             except cv2.error as denoise_err:
@@ -174,6 +177,7 @@ def handle_pdf_ocr(engine: OCREngine):
 
             page_conf = calculate_average_confidence(results)
             print(f"         -> {len(results)} line(s) detected, avg confidence {page_conf}%")
+
             del page_image, resized, gray, denoised, processed
 
         os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -187,6 +191,7 @@ def handle_pdf_ocr(engine: OCREngine):
         if docx_path:
             print(f"[SUCCESS] DOCX saved to: {docx_path}")
 
+        # Show both outputs in terminal
         show_txt_output(txt_path)
         show_docx_output(docx_path)
 
@@ -233,9 +238,9 @@ def handle_batch_ocr(engine: OCREngine):
             txt_path, docx_path = save_image_ocr_output(results, image_path, OUTPUT_DIR)
             conf = calculate_average_confidence(results)
             print(f"         -> {len(results)} line(s), avg confidence {conf}%")
-            print(f"            TXT : {txt_path}")
+            print(f"            TXT : {os.path.basename(txt_path)}")
             if docx_path:
-                print(f"            DOCX: {docx_path}")
+                print(f"            DOCX: {os.path.basename(docx_path)}")
             saved_pairs.append((txt_path, docx_path))
             success_count += 1
         except Exception as e:
@@ -244,6 +249,7 @@ def handle_batch_ocr(engine: OCREngine):
 
     print(f"\n[BATCH COMPLETE] Success: {success_count} | Failed: {fail_count}")
 
+    # Show all outputs in terminal
     for txt_path, docx_path in saved_pairs:
         show_txt_output(txt_path)
         show_docx_output(docx_path)
@@ -251,7 +257,6 @@ def handle_batch_ocr(engine: OCREngine):
 
 def main():
     print_banner()
-    print(f"[INFO] Output folder: {OUTPUT_DIR}")
     print("[INFO] Initializing OCR engine (loading PaddleOCR models)...")
     try:
         engine = OCREngine(lang="en", use_angle_cls=True)
