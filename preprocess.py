@@ -1,50 +1,9 @@
-"""
-preprocess.py
---------------
-Image preprocessing utilities for the OCR pipeline.
-
-WHY PREPROCESSING MATTERS:
-PaddleOCR's text detector and recognizer were trained on a mix of clean and
-noisy images, but OCR accuracy almost always improves when you hand the
-model a clean, high-contrast, correctly-sized image instead of a raw photo
-or scan. This module applies four classic preprocessing steps:
-
-    1. Grayscale conversion -> removes color noise, OCR only needs intensity
-    2. Denoising            -> removes scanner/camera sensor noise
-    3. Thresholding         -> increases text/background contrast
-    4. Resizing             -> upscales small text so the detector can find it
-
-Each step is optional and controlled by flags so you can A/B test which
-combination works best on your own sample images (this matters for your
-PHASE 7 testing/accuracy report).
-"""
-
 import cv2
 import numpy as np
 import os
 
 
 def load_image(image_path: str) -> np.ndarray:
-    """
-    Load an image from disk using OpenCV.
-
-    Parameters
-    ----------
-    image_path : str
-        Path to the image file (.jpg, .jpeg, .png, .bmp, .tiff)
-
-    Returns
-    -------
-    np.ndarray
-        Image in BGR format (OpenCV's default).
-
-    Raises
-    ------
-    FileNotFoundError
-        If the path does not exist.
-    ValueError
-        If OpenCV could not decode the file (corrupt or unsupported format).
-    """
     if not os.path.exists(image_path):
         raise FileNotFoundError(f"Image not found: {image_path}")
 
@@ -59,29 +18,14 @@ def load_image(image_path: str) -> np.ndarray:
 
 
 def convert_to_grayscale(image: np.ndarray) -> np.ndarray:
-    """Convert a BGR image to single-channel grayscale."""
     return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
 
 def denoise_image(gray_image: np.ndarray) -> np.ndarray:
-    """
-    Remove noise using OpenCV's fast non-local means denoising.
-
-    fastNlMeansDenoising is preferred over a simple blur because it
-    smooths noise while preserving text edges, which matters a lot
-    for OCR accuracy on scanned/photographed documents.
-    """
     return cv2.fastNlMeansDenoising(gray_image, h=10, templateWindowSize=7, searchWindowSize=21)
 
 
 def apply_threshold(gray_image: np.ndarray) -> np.ndarray:
-    """
-    Apply adaptive thresholding to binarize the image (pure black/white).
-
-    Adaptive thresholding is used instead of a single global threshold
-    because lighting is rarely uniform across a scanned page/photo —
-    adaptive thresholding calculates a local threshold for each region.
-    """
     return cv2.adaptiveThreshold(
         gray_image,
         255,
@@ -93,15 +37,6 @@ def apply_threshold(gray_image: np.ndarray) -> np.ndarray:
 
 
 def resize_image(image: np.ndarray, max_dimension: int = 2000) -> np.ndarray:
-    """
-    Resize the image so its longest side does not exceed max_dimension,
-    upscaling small images and downscaling very large ones.
-
-    Why: PaddleOCR's text detector works on a fixed internal resolution.
-    Very small images make tiny text undetectable; very large images
-    slow down inference without adding accuracy. 2000px is a reasonable
-    practical ceiling for document images on a CPU.
-    """
     height, width = image.shape[:2]
     longest_side = max(height, width)
 
@@ -114,6 +49,53 @@ def resize_image(image: np.ndarray, max_dimension: int = 2000) -> np.ndarray:
 
     interpolation = cv2.INTER_CUBIC if scale > 1 else cv2.INTER_AREA
     return cv2.resize(image, (new_width, new_height), interpolation=interpolation)
+
+
+def preprocess_array(
+    image: np.ndarray,
+    do_grayscale: bool = True,
+    do_denoise: bool = True,
+    do_threshold: bool = False,
+    do_resize: bool = True,
+    save_debug_path: str = None,
+) -> np.ndarray:
+    """
+    Run the full preprocessing pipeline on an already-loaded image array
+    (e.g. a PDF page rasterized by pdf_handler.iter_pdf_pages, or any
+    in-memory frame) and return a NumPy array ready to feed into
+    PaddleOCR.
+
+    This is the shared core used by both `preprocess_image` (file-path
+    entry point, for the image-upload flow) and main.py's PDF flow, so
+    the two flows can never drift out of sync on denoise parameters,
+    thresholding availability, or the grayscale->3-channel conversion
+    PaddleOCR requires.
+
+    See `preprocess_image` for parameter docs — identical, minus the
+    file-loading step.
+    """
+    if do_resize:
+        image = resize_image(image)
+
+    if do_grayscale:
+        image = convert_to_grayscale(image)
+
+        if do_denoise:
+            image = denoise_image(image)
+
+        if do_threshold:
+            image = apply_threshold(image)
+
+        # PaddleOCR expects a 3-channel image even if visually grayscale
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    elif do_denoise:
+        # Denoise in color if grayscale was skipped
+        image = cv2.fastNlMeansDenoisingColored(image, h=10, hColor=10)
+
+    if save_debug_path:
+        cv2.imwrite(save_debug_path, image)
+
+    return image
 
 
 def preprocess_image(
@@ -152,26 +134,11 @@ def preprocess_image(
         Preprocessed image array.
     """
     image = load_image(image_path)
-
-    if do_resize:
-        image = resize_image(image)
-
-    if do_grayscale:
-        image = convert_to_grayscale(image)
-
-        if do_denoise:
-            image = denoise_image(image)
-
-        if do_threshold:
-            image = apply_threshold(image)
-
-        # PaddleOCR expects a 3-channel image even if visually grayscale
-        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-    elif do_denoise:
-        # Denoise in color if grayscale was skipped
-        image = cv2.fastNlMeansDenoisingColored(image, h=10, hColor=10)
-
-    if save_debug_path:
-        cv2.imwrite(save_debug_path, image)
-
-    return image
+    return preprocess_array(
+        image,
+        do_grayscale=do_grayscale,
+        do_denoise=do_denoise,
+        do_threshold=do_threshold,
+        do_resize=do_resize,
+        save_debug_path=save_debug_path,
+    )

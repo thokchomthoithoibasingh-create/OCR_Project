@@ -12,7 +12,7 @@ import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from preprocess import preprocess_image, preprocess_array
+from preprocess import preprocess_image
 from ocr_engine import OCREngine
 from pdf_handler import iter_pdf_pages, get_pdf_page_count
 from output_writer import (
@@ -149,6 +149,9 @@ def handle_pdf_ocr(engine: OCREngine):
         return
 
     try:
+        import cv2
+        from preprocess import resize_image
+
         print("[INFO] Reading PDF page count...")
         total_pages = get_pdf_page_count(pdf_path, poppler_path=POPPLER_PATH)
         print(f"[INFO] {total_pages} page(s) found.")
@@ -157,18 +160,21 @@ def handle_pdf_ocr(engine: OCREngine):
         for page_number, page_image in iter_pdf_pages(pdf_path, dpi=150, poppler_path=POPPLER_PATH):
             print(f"[INFO] Running OCR on page {page_number}/{total_pages}...", flush=True)
 
-            # Same preprocessing pipeline as the image flow (preprocess.py),
-            # just entered via the array-based core instead of the
-            # file-path entry point, since PDF pages are already in memory.
-            processed = preprocess_array(
-                page_image, do_grayscale=True, do_denoise=True, do_resize=True
-            )
+            resized = resize_image(page_image, max_dimension=2000)
+            gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+            try:
+                denoised = cv2.fastNlMeansDenoising(gray, h=10)
+            except cv2.error as denoise_err:
+                print(f"         -> [WARNING] Denoising failed ({denoise_err}); using grayscale.")
+                denoised = gray
+
+            processed = cv2.cvtColor(denoised, cv2.COLOR_GRAY2BGR)
             results = engine.run(processed)
             all_page_results.append(results)
 
             page_conf = calculate_average_confidence(results)
             print(f"         -> {len(results)} line(s) detected, avg confidence {page_conf}%")
-            del page_image, processed
+            del page_image, resized, gray, denoised, processed
 
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         txt_path, docx_path = save_pdf_ocr_output(all_page_results, pdf_path, OUTPUT_DIR)

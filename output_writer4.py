@@ -1,16 +1,66 @@
 """
 output_writer.py
 -----------------
-Takes raw OCR results and saves to both .txt and .docx files, preserving
-table layout (rows/columns) where detected, instead of merging table
-cells into jumbled paragraph text.
+Takes raw OCR results and saves to both .txt and .docx files.
+
+CHANGE LOG (line-merging fix)
+------------------------------
+PaddleOCR's detection model returns one entry per detected *visual* text
+line — not one entry per *logical* paragraph/sentence. When a numbered
+question's number sits in its own little bounding box, slightly separated
+from the question text (common with scanned/photographed pages, uneven
+spacing, or a numbering column), that number was previously written out
+as its own standalone paragraph in the DOCX/TXT output:
+
+    4.
+    What are the different modes of data transfer?
+
+instead of:
+
+    4. What are the different modes of data transfer?
+
+To fix this without a full layout model, we use the only spatial signal
+available from OCREngine's output (the 4-corner `box` for each line) to
+decide which consecutive lines belong in the same paragraph:
+
+    1. Estimate each line's height from its box.
+    2. Measure the vertical gap from the bottom of one line to the top
+       of the next.
+    3. If that gap is small relative to typical line height, the lines
+       are merged into one paragraph (this is what reattaches a wrapped
+       line, or a split "4." to its question text).
+    4. A line that is short AND looks like a bare list/numbering marker
+       (e.g. "4.", "(b)", "iii.", "a)") is *always* merged forward into
+       the next line, regardless of gap size — a lone numbering token is
+       never emitted as its own paragraph.
+
+This is still a heuristic (see OCREngine._sort_reading_order's own
+docstring for the same caveat) — it will not perfectly reconstruct
+multi-column layouts — but it removes the most common and jarring
+artifact: numbering torn away from its text.
+
+Additionally, the DOCX output no longer includes the "OCR Output Report"
+metadata header/banner. That header is processing metadata, not part of
+the source document, so embedding it in the DOCX made every output look
+like a scan report rather than a clean copy of the document. The TXT
+output still includes the metadata header (useful there, since .txt is
+treated as a log/record), but the DOCX now contains only the merged
+document text.
+
+CHANGE LOG (confidence robustness fix)
+---------------------------------------
+merge_lines_into_paragraphs previously assumed every result's
+"confidence" value was numeric. If an OCR engine ever emits None for a
+low-quality/unscored detection, summing confidences for averaging would
+raise TypeError and abort the whole run. All confidence reads now go
+through _safe_conf(), which coerces None/non-numeric values to 0.0
+instead of crashing. This does not change output for normal numeric
+confidences.
 """
 
 import os
 import re
 from datetime import datetime
-
-from table_detector import detect_blocks
 
 try:
     from docx import Document
@@ -19,12 +69,17 @@ except ImportError:
     DOCX_AVAILABLE = False
 
 
+# A line counts as a "bare numbering marker" if, after stripping
+# whitespace, it matches things like: "4.", "12.", "(b)", "iii)", "a."
+# Short + matches this pattern => always glued to the next line.
 _NUMBERING_MARKER_RE = re.compile(
     r"^\(?(\d{1,3}|[a-zA-Z]{1,3}|[ivxlcdm]{1,6})\)?[.)]?$"
 )
 
 
 def _is_bare_marker(text: str) -> bool:
+    """True if `text` looks like a standalone list/number marker with no
+    actual content of its own (e.g. '4.', '(b)', 'iii.')."""
     candidate = text.strip()
     if not candidate or len(candidate) > 6:
         return False
@@ -45,10 +100,35 @@ def _line_bottom(item: dict) -> float:
 
 
 def _safe_conf(value) -> float:
+    """Coerce a possibly-missing/None confidence value to a float so
+    averaging never raises TypeError on low-quality detections."""
     return float(value) if isinstance(value, (int, float)) else 0.0
 
 
 def merge_lines_into_paragraphs(results: list, gap_ratio: float = 0.6) -> list:
+    """
+    Merge consecutive OCR line-entries (already in reading order) into
+    logical paragraphs.
+
+    Parameters
+    ----------
+    results : list of dict
+        OCR line results, each with 'text', 'confidence', 'box', already
+        sorted into reading order (see OCREngine._sort_reading_order).
+    gap_ratio : float
+        A line is merged with the previous one if the vertical gap
+        between them is less than `gap_ratio * average_line_height` of
+        the two lines involved. Tuned conservatively (0.6) so genuinely
+        separate paragraphs/questions stay separate, while wrapped lines
+        and split numbering still merge.
+
+    Returns
+    -------
+    list of dict
+        Each dict has:
+            'text'       : merged paragraph text
+            'confidence' : average confidence across merged lines
+    """
     if not results:
         return []
 
@@ -65,6 +145,9 @@ def merge_lines_into_paragraphs(results: list, gap_ratio: float = 0.6) -> list:
         close_enough = gap <= gap_ratio * avg_height
 
         if prev_is_marker or close_enough:
+            # Glue this line onto the current paragraph. A bare marker
+            # ("4.") gets joined with no space-doubling weirdness; normal
+            # continuations get a single space.
             if prev_is_marker:
                 current_texts[-1] = f"{current_texts[-1]} {item['text']}".strip()
             else:
@@ -101,6 +184,13 @@ def format_results_for_display(results: list, show_confidence: bool = True) -> s
     return "\n".join(lines)
 
 
+def format_plain_text(results: list) -> str:
+    if not results:
+        return ""
+    merged = merge_lines_into_paragraphs(results)
+    return "\n".join(item["text"] for item in merged)
+
+
 def calculate_average_confidence(results: list) -> float:
     if not results:
         return 0.0
@@ -108,67 +198,35 @@ def calculate_average_confidence(results: list) -> float:
     return round((total / len(results)) * 100, 2)
 
 
-def _flatten_blocks(results):
-    """Yields ('para', [ocr items]) or ('table', [[str,...],...]) in original order."""
-    group = []
-    for b in detect_blocks(results):
-        if b["type"] == "table":
-            if group:
-                yield ("para", group)
-                group = []
-            yield ("table", b["rows"])
-        else:
-            group.extend(b["items"])
-    if group:
-        yield ("para", group)
-
-
-def _render_table_md(rows):
-    return "\n".join("| " + " | ".join(r) + " |" for r in rows)
-
-
-def format_plain_text(results: list) -> str:
-    if not results:
-        return ""
-    out = []
-    for kind, payload in _flatten_blocks(results):
-        if kind == "table":
-            out.append(_render_table_md(payload))
-        else:
-            out.extend(item["text"] for item in merge_lines_into_paragraphs(payload))
-    return "\n".join(out)
-
-
-def _add_blocks_to_doc(doc, results):
-    for kind, payload in _flatten_blocks(results):
-        if kind == "table":
-            ncols = max(len(r) for r in payload)
-            table = doc.add_table(rows=0, cols=ncols)
-            table.style = "Table Grid"
-            for r in payload:
-                cells = table.add_row().cells
-                for idx in range(ncols):
-                    cells[idx].text = r[idx] if idx < len(r) else ""
-        else:
-            for item in merge_lines_into_paragraphs(payload):
-                doc.add_paragraph(item["text"])
-
-
 def _build_image_docx(results: list, source_filename: str):
+    """
+    Build a clean DOCX containing only the merged document text — no
+    OCR metadata/report header. The DOCX is meant to look like the
+    source document, not a processing log.
+    """
     doc = Document()
-    _add_blocks_to_doc(doc, results)
+    merged = merge_lines_into_paragraphs(results)
+    for item in merged:
+        doc.add_paragraph(item["text"])
     return doc
 
 
 def _build_pdf_docx(page_results: list, source_filename: str):
-    from docx.enum.text import WD_BREAK  # noqa: F401 (kept for compat)
+    """
+    Build a clean multi-page DOCX: merged paragraph text per page, with
+    a page break between pages and no OCR metadata/report header.
+    """
+    from docx.enum.text import WD_BREAK
 
     doc = Document()
     for page_num, results in enumerate(page_results, start=1):
-        if results:
-            _add_blocks_to_doc(doc, results)
+        merged = merge_lines_into_paragraphs(results)
+        if merged:
+            for item in merged:
+                doc.add_paragraph(item["text"])
         else:
             doc.add_paragraph("[No text detected on this page]")
+
         if page_num < len(page_results):
             doc.add_page_break()
     return doc
@@ -178,6 +236,7 @@ def save_image_ocr_output(results: list, source_filename: str, output_dir: str):
     os.makedirs(output_dir, exist_ok=True)
     base_name = os.path.splitext(os.path.basename(source_filename))[0]
 
+    # TXT — keeps the metadata header; this file is treated as a log/record.
     txt_path = os.path.join(output_dir, f"{base_name}_ocr_output.txt")
     avg_conf = calculate_average_confidence(results)
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -195,6 +254,7 @@ def save_image_ocr_output(results: list, source_filename: str, output_dir: str):
         f.write(format_plain_text(results))
         f.write("\n")
 
+    # DOCX — clean document text only, no metadata header.
     docx_path = None
     if DOCX_AVAILABLE:
         docx_path = os.path.join(output_dir, f"{base_name}_ocr_output.docx")
@@ -207,6 +267,7 @@ def save_pdf_ocr_output(page_results: list, source_filename: str, output_dir: st
     os.makedirs(output_dir, exist_ok=True)
     base_name = os.path.splitext(os.path.basename(source_filename))[0]
 
+    # TXT — keeps the metadata header; this file is treated as a log/record.
     txt_path = os.path.join(output_dir, f"{base_name}_ocr_output.txt")
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     total_lines = sum(len(p) for p in page_results)
@@ -233,6 +294,8 @@ def save_pdf_ocr_output(page_results: list, source_filename: str, output_dir: st
         f.write("\n".join(body_parts))
         f.write("\n")
 
+    # DOCX — clean document text only, no metadata header, page breaks
+    # between source pages.
     docx_path = None
     if DOCX_AVAILABLE:
         docx_path = os.path.join(output_dir, f"{base_name}_ocr_output.docx")
