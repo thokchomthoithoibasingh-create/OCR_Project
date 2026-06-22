@@ -1,0 +1,38 @@
+# Virtual Environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# PaddleOCR / Paddle model cache
+inference/
+*.pdmodel
+*.pdiparams
+*.pdopt
+
+# Output files
+output/
+text_outputs/
+
+
+# Jupyter Notebooks checkpoints
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/
+
+# Logs
+*.log
+
+# Poppler / temp files
+*.ppm
+*.pbm
